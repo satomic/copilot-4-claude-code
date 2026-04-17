@@ -568,6 +568,7 @@ async def messages(request: Request):
         # Remove fields sent by Anthropic/Claude Code that Copilot does not support
         forward_body.pop("betas", None)
         forward_body.pop("context_management", None)
+        forward_body.pop("output_config", None)
     else:
         # ── Non-Claude models: convert to OpenAI format ─────────────────
         endpoint = "/chat/completions"
