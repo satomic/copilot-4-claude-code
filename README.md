@@ -38,7 +38,7 @@ pip install -r requirements.txt
 ### Start the proxy
 
 ```bash
-python main.py
+python cp4cc.py
 ```
 
 On first run, you will be prompted to authenticate via GitHub OAuth Device Flow:
@@ -68,12 +68,19 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=dummy claude
 
 ## Dashboard
 
-A web dashboard is available at **http://localhost:8082/ui** showing:
+A web dashboard is available at **http://localhost:8082/ui** with a responsive two-column layout:
 
-- Live request statistics (total, success, errors)
-- Available models and their supported endpoints
-- Recent request log with model mapping, status, and duration
-- Claude Code configuration snippets
+**Left panel — Models**
+- Lists all available Copilot models with their supported endpoints
+- Claude models (direct `/v1/messages` passthrough) are grouped separately from other models
+
+**Right panel — Requests (current session)**
+- Live request list showing time, model, status, duration, message type breakdown, and a content preview
+- Message types are color-coded: `msg` (blue) · `tool↑` tool_use (orange) · `tool↓` tool_result (purple)
+- Preview column shows the last message's text; for tool messages the full body (tool name + input / result) is displayed
+- List auto-refreshes every 5 seconds; only current session data is shown
+
+The header strip also provides one-click copy of the Claude Code configuration commands and live stats (total / OK / error counts).
 
 ## API Endpoints
 
@@ -83,8 +90,8 @@ A web dashboard is available at **http://localhost:8082/ui** showing:
 | `GET /v1/models` | List available models (Anthropic format) |
 | `POST /v1/messages` | Main proxy endpoint (Anthropic format) |
 | `GET /v1/models/refresh` | Force refresh model list |
-| `GET /audit/sessions` | List audit session files |
-| `GET /audit/current` | Current session audit log |
+| `GET /audit/sessions` | List all audit session files |
+| `GET /audit/current` | Current session audit log (JSON) |
 | `GET /ui` | Web dashboard |
 
 ## Model Name Mapping
@@ -103,13 +110,13 @@ Claude Code model names are automatically mapped to Copilot format:
 - Application logs: `logs/app.log`
 - Per-session audit logs: `logs/audit/session_YYYYMMDD_HHMMSS_<id>.json`
 
-Each audit entry captures the original model, mapped model, endpoint, status code, duration, and a preview of the request/response.
+Each audit entry captures: original model, mapped Copilot model, endpoint, stream flag, per-message breakdown (role / type / full body), status code, duration, and response body (up to 2000 chars for streamed responses).
 
 ## Project Structure
 
 ```
 .
-├── main.py              # Proxy server (FastAPI)
+├── cp4cc.py             # Proxy server (FastAPI)
 ├── requirements.txt     # Python dependencies
 ├── logs/
 │   ├── app.log          # Application log
