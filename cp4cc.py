@@ -884,7 +884,7 @@ if not ARGS.fast:
             <thead>
               <tr>
                 <th style="width:60px">Time</th>
-                <th style="width:100px">Model</th>
+                <th style="width:170px">Model</th>
                 <th style="width:40px">St</th>
                 <th style="width:48px">ms</th>
                 <th style="width:90px">Type</th>
@@ -986,7 +986,7 @@ if not ARGS.fast:
         const preview  = lastPreview(r);
         return `<tr>
           <td class="muted mono" style="white-space:nowrap">${{ts}}</td>
-          <td class="mono trunc" style="max-width:100px">${{esc(r.copilot_model||r.original_model||'')}}</td>
+          <td class="mono trunc" style="max-width:170px">${{esc(r.copilot_model||r.original_model||'')}}</td>
           <td><span class="${{cls}}">${{r.response?.status_code??'—'}}</span></td>
           <td class="muted" style="white-space:nowrap">${{r.duration_ms!=null?Math.round(r.duration_ms):'—'}}</td>
           <td>${{typeTags||'<span class="muted">—</span>'}}</td>
