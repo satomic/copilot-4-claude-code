@@ -1,5 +1,7 @@
 # copilot-4-claude-code
 
+[English](README.md) | [中文](README.zh.md)
+
 A local proxy server that exposes **GitHub Copilot** as a standard **Anthropic API**, enabling tools like [Claude Code](https://claude.ai/code) to use it as a backend.
 
 ## How It Works
@@ -52,19 +54,38 @@ On first run, you will be prompted to authenticate via GitHub OAuth Device Flow:
 
 Once authenticated, the proxy starts on port `8082`.
 
+### Startup options
+
+| Flag | Description |
+|---|---|
+| *(none)* | Bind to `127.0.0.1`, UI and audit enabled |
+| `--share` | Bind to `0.0.0.0` — LAN accessible ⚠ |
+| `--fast` | Disable UI and audit for lower overhead |
+| `--port N` | Listen on port N (default: 8082) |
+
+```bash
+python cp4cc.py --share          # share with LAN
+python cp4cc.py --fast           # proxy only, no UI
+python cp4cc.py --fast --share   # both
+python cp4cc.py --port 9000      # custom port
+python cp4cc.py --help           # full help
+```
+
 ### Configure Claude Code
 
 **Option 1: Persistent environment variables**
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:8082
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8082
 export ANTHROPIC_AUTH_TOKEN=dummy
 claude
 ```
 
 **Option 2: Single launch**
 ```bash
-ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=dummy claude
+ANTHROPIC_BASE_URL=http://127.0.0.1:8082 ANTHROPIC_AUTH_TOKEN=dummy claude
 ```
+
+> If using `--share` or `--port`, replace the host/port accordingly.
 
 ## Dashboard
 

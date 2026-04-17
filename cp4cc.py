@@ -14,6 +14,7 @@ Authentication flow:
   3. Copilot API key + specific headers → request GitHub Copilot API
 """
 
+import argparse
 import json
 import logging
 import os
@@ -27,6 +28,40 @@ from uuid import uuid4
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+
+# ============================================================
+# CLI Arguments (parsed early so all modules can read them)
+# ============================================================
+
+_parser = argparse.ArgumentParser(
+    description="GitHub Copilot → Anthropic API Proxy (cp4cc)",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog="""
+modes:
+  default     listen on 127.0.0.1 (local only), UI + audit enabled
+  --share     listen on 0.0.0.0   (LAN accessible)
+  --fast      listen on 127.0.0.1, UI and audit endpoints disabled
+""",
+)
+_parser.add_argument(
+    "--share",
+    action="store_true",
+    default=False,
+    help="bind to 0.0.0.0 so others on the LAN can use the proxy",
+)
+_parser.add_argument(
+    "--fast",
+    action="store_true",
+    default=False,
+    help="disable UI and audit endpoints for lower overhead",
+)
+_parser.add_argument(
+    "--port",
+    type=int,
+    default=8082,
+    help="port to listen on (default: 8082)",
+)
+ARGS = _parser.parse_args()
 
 # ============================================================
 # Constants
@@ -84,6 +119,8 @@ _audit_data: dict = {
 
 
 def _write_audit() -> None:
+    if ARGS.fast:
+        return
     with open(AUDIT_FILE, "w", encoding="utf-8") as f:
         json.dump(_audit_data, f, indent=2, ensure_ascii=False)
 
@@ -98,6 +135,13 @@ def audit_log(
     duration_ms: float,
     error: str | None = None,
 ) -> None:
+    if ARGS.fast:
+        logger.info(
+            "request id=%s model=%s→%s endpoint=%s status=%s duration=%.0fms%s",
+            req_id[:8], request_body.get("model",""), copilot_model, endpoint,
+            status_code, duration_ms, f" ERROR={error}" if error else "",
+        )
+        return
     messages = request_body.get("messages", [])
 
     # Per-message type breakdown: classify each message
@@ -634,29 +678,29 @@ async def refresh_models():
     return {"count": len(models), "models": [m["id"] for m in models]}
 
 
-@app.get("/audit/sessions")
-def audit_sessions():
-    """List all audit session files"""
-    files = sorted(AUDIT_DIR.glob("session_*.json"), reverse=True)
-    result = []
-    for f in files[:20]:
-        try:
-            data = json.loads(f.read_text())
-            result.append({
-                "file": f.name,
-                "session_id": data.get("session_id", ""),
-                "started_at": data.get("started_at", ""),
-                "request_count": len(data.get("requests", [])),
-            })
-        except Exception:
-            pass
-    return result
+if not ARGS.fast:
+    @app.get("/audit/sessions")
+    def audit_sessions():
+        """List all audit session files"""
+        files = sorted(AUDIT_DIR.glob("session_*.json"), reverse=True)
+        result = []
+        for f in files[:20]:
+            try:
+                data = json.loads(f.read_text())
+                result.append({
+                    "file": f.name,
+                    "session_id": data.get("session_id", ""),
+                    "started_at": data.get("started_at", ""),
+                    "request_count": len(data.get("requests", [])),
+                })
+            except Exception:
+                pass
+        return result
 
-
-@app.get("/audit/current")
-def audit_current():
-    """Return current session audit log"""
-    return _audit_data
+    @app.get("/audit/current")
+    def audit_current():
+        """Return current session audit log"""
+        return _audit_data
 
 
 
@@ -666,281 +710,282 @@ def audit_current():
 # Dashboard UI
 # ============================================================
 
-@app.get("/ui", response_class=HTMLResponse)
-async def dashboard():
-    models = get_models()
-    api_base = get_api_base()
-    uptime = datetime.now(timezone.utc) - SESSION_START
-    h, m = int(uptime.total_seconds() // 3600), int((uptime.total_seconds() % 3600) // 60)
-    uptime_str = f"{h}h {m}m" if h else f"{m}m {int(uptime.total_seconds() % 60)}s"
-
-    req_count = len(_audit_data["requests"])
-    ok_count = sum(1 for r in _audit_data["requests"] if r["response"]["status_code"] == 200)
-    err_count = req_count - ok_count
-
-    claude_models = [m for m in models if m["id"].startswith("claude")]
-    other_models  = [m for m in models if not m["id"].startswith("claude")]
-
-    def ep_tag(ep):
-        cls = "tag-green" if "/v1/messages" in ep else "tag-blue"
-        return f'<span class="tag {cls}">{ep}</span>'
-
-    def model_rows(mlist):
-        rows = []
-        for m in mlist:
-            eps = "".join(ep_tag(e) for e in (m.get("supported_endpoints") or []))
-            star = '<span class="star">★</span>' if m.get("model_picker_enabled") else ""
-            rows.append(
-                f'<tr><td class="mono">{m["id"]}</td>'
-                f'<td class="muted">{m.get("name","")}</td>'
-                f'<td>{eps or "<span class=muted>—</span>"}</td>'
-                f'<td>{star}</td></tr>'
-            )
-        return "".join(rows)
-
-    html = f"""<!DOCTYPE html>
-<html lang="en" data-theme="dark">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Copilot Proxy</title>
-<style>
-:root[data-theme="dark"] {{
-  --bg:#0f1117; --surface:#1a1d27; --border:#2a2d3a; --text:#e2e4ed;
-  --muted:#6b7280; --accent:#60a5fa; --green:#34d399; --red:#f87171;
-  --code-bg:#12151f; --hover:#21242f;
-  --tag-g-bg:#064e3b; --tag-g-fg:#6ee7b7;
-  --tag-b-bg:#1e3a5f; --tag-b-fg:#93c5fd;
-  --btn-bg:#1d4ed8; --btn-hover:#2563eb; --star:#fbbf24;
-}}
-:root[data-theme="light"] {{
-  --bg:#f8f9fb; --surface:#ffffff; --border:#e5e7eb; --text:#111827;
-  --muted:#6b7280; --accent:#2563eb; --green:#059669; --red:#dc2626;
-  --code-bg:#f1f3f7; --hover:#f3f4f6;
-  --tag-g-bg:#d1fae5; --tag-g-fg:#065f46;
-  --tag-b-bg:#dbeafe; --tag-b-fg:#1e40af;
-  --btn-bg:#2563eb; --btn-hover:#1d4ed8; --star:#d97706;
-}}
-*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;line-height:1.5;background:var(--bg);color:var(--text);transition:background .2s,color .2s}}
-/* header */
-.header{{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:10;gap:10px;flex-wrap:wrap}}
-.header-left{{display:flex;align-items:center;gap:10px}}
-.header-title{{font-size:15px;font-weight:600}}
-.pulse{{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s ease-in-out infinite;flex-shrink:0}}
-@keyframes pulse{{0%,100%{{opacity:1;transform:scale(1)}}50%{{opacity:.5;transform:scale(.85)}}}}
-.header-meta{{font-size:12px;color:var(--muted)}}
-.header-right{{display:flex;align-items:center;gap:8px}}
-.pill{{font-size:12px;color:var(--muted);background:var(--bg);border:1px solid var(--border);border-radius:99px;padding:3px 10px}}
-.theme-btn{{cursor:pointer;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);padding:5px 10px;font-size:13px;transition:background .15s}}
-.theme-btn:hover{{background:var(--hover)}}
-/* config strip */
-.config-strip{{display:flex;align-items:center;gap:10px;padding:8px 20px;background:var(--surface);border-bottom:1px solid var(--border);flex-wrap:wrap}}
-.config-label{{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);white-space:nowrap}}
-.code-inline{{font-family:'SF Mono','Fira Code',monospace;font-size:12px;background:var(--code-bg);border:1px solid var(--border);border-radius:5px;padding:4px 10px;color:var(--accent);flex:1;min-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-.copy-btn{{background:var(--btn-bg);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;transition:background .15s;white-space:nowrap;flex-shrink:0}}
-.copy-btn:hover{{background:var(--btn-hover)}}
-.config-sep{{width:1px;height:24px;background:var(--border);flex-shrink:0}}
-/* stats */
-.stats-inline{{display:flex;gap:16px;align-items:center;margin-left:auto}}
-.stat-item{{text-align:center}}
-.stat-num{{font-size:17px;font-weight:700;line-height:1}}
-.stat-label{{font-size:10px;color:var(--muted)}}
-.num-green{{color:var(--green)}} .num-red{{color:var(--red)}} .num-blue{{color:var(--accent)}}
-/* page grid */
-.page{{display:grid;grid-template-columns:minmax(260px,30%) 1fr;height:calc(100vh - 88px);overflow:hidden}}
-@media(max-width:800px){{.page{{grid-template-columns:1fr;height:auto}}}}
-/* panels */
-.panel{{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border)}}
-.panel:last-child{{border-right:none}}
-.panel-header{{display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}}
-.panel-title{{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}}
-.panel-body{{flex:1;overflow-y:auto}}
-/* tables */
-table{{width:100%;border-collapse:collapse;font-size:12.5px}}
-th{{text-align:left;padding:7px 12px;font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--surface);z-index:1}}
-td{{padding:7px 12px;border-bottom:1px solid var(--border);vertical-align:middle}}
-tr:last-child td{{border-bottom:none}}
-tr:hover td{{background:var(--hover)}}
-.mono{{font-family:'SF Mono','Fira Code',monospace;font-size:12px}}
-.muted{{color:var(--muted)}}
-.trunc{{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}}
-.empty{{text-align:center;color:var(--muted);padding:24px}}
-/* tags */
-.tag{{display:inline-block;font-size:10px;border-radius:3px;padding:1px 5px;margin:1px;font-family:monospace;white-space:nowrap}}
-.tag-green{{background:var(--tag-g-bg);color:var(--tag-g-fg)}}
-.tag-blue{{background:var(--tag-b-bg);color:var(--tag-b-fg)}}
-.tag-orange{{background:#431407;color:#fdba74}}
-.tag-purple{{background:#2e1065;color:#c4b5fd}}
-.status-ok{{color:var(--green);font-weight:600}}
-.status-err{{color:var(--red);font-weight:600}}
-.star{{color:var(--star)}}
-.req-row{{cursor:default}}
-</style>
-</head>
-<body>
-<div class="header">
-  <div class="header-left">
-    <div class="pulse"></div>
-    <span class="header-title">Copilot Proxy</span>
-    <span class="header-meta">session {SESSION_ID[:8]} · {api_base}</span>
-  </div>
-  <div class="header-right">
-    <span class="pill">⏱ {uptime_str}</span>
-    <button class="theme-btn" onclick="toggleTheme()" id="themeBtn">☀ Light</button>
-  </div>
-</div>
-
-<div class="config-strip">
-  <span class="config-label">Claude Code</span>
-  <code class="code-inline" id="cfg1val">export ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=dummy</code>
-  <button class="copy-btn" onclick="copyText('cfg1val')">Copy</button>
-  <div class="config-sep"></div>
-  <code class="code-inline" id="cfg2val">ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=dummy claude</code>
-  <button class="copy-btn" onclick="copyText('cfg2val')">Copy</button>
-  <div class="stats-inline">
-    <div class="stat-item"><div class="stat-num num-blue" id="s-total">{req_count}</div><div class="stat-label">Total</div></div>
-    <div class="stat-item"><div class="stat-num num-green" id="s-ok">{ok_count}</div><div class="stat-label">OK</div></div>
-    <div class="stat-item"><div class="stat-num num-red" id="s-err">{err_count}</div><div class="stat-label">Err</div></div>
-    <div class="stat-item"><div class="stat-num">{len(models)}</div><div class="stat-label">Models</div></div>
-  </div>
-</div>
-
-<div class="page">
-  <!-- Models -->
-  <div class="panel">
-    <div class="panel-header"><span class="panel-title">Models ({len(models)})</span></div>
-    <div class="panel-body">
-      <table>
-        <thead><tr><th>Model ID</th><th>Name</th><th>Endpoint</th><th></th></tr></thead>
-        <tbody>
-          <tr><td colspan="4" style="padding:5px 12px;font-size:10px;font-weight:600;color:var(--muted);background:var(--bg)">CLAUDE — /v1/messages passthrough</td></tr>
-          {model_rows(claude_models)}
-          <tr><td colspan="4" style="padding:5px 12px;font-size:10px;font-weight:600;color:var(--muted);background:var(--bg)">Other Models</td></tr>
-          {model_rows(other_models)}
-        </tbody>
-      </table>
+if not ARGS.fast:
+    @app.get("/ui", response_class=HTMLResponse)
+    async def dashboard():
+        models = get_models()
+        api_base = get_api_base()
+        uptime = datetime.now(timezone.utc) - SESSION_START
+        h, m = int(uptime.total_seconds() // 3600), int((uptime.total_seconds() % 3600) // 60)
+        uptime_str = f"{h}h {m}m" if h else f"{m}m {int(uptime.total_seconds() % 60)}s"
+    
+        req_count = len(_audit_data["requests"])
+        ok_count = sum(1 for r in _audit_data["requests"] if r["response"]["status_code"] == 200)
+        err_count = req_count - ok_count
+    
+        claude_models = [m for m in models if m["id"].startswith("claude")]
+        other_models  = [m for m in models if not m["id"].startswith("claude")]
+    
+        def ep_tag(ep):
+            cls = "tag-green" if "/v1/messages" in ep else "tag-blue"
+            return f'<span class="tag {cls}">{ep}</span>'
+    
+        def model_rows(mlist):
+            rows = []
+            for m in mlist:
+                eps = "".join(ep_tag(e) for e in (m.get("supported_endpoints") or []))
+                star = '<span class="star">★</span>' if m.get("model_picker_enabled") else ""
+                rows.append(
+                    f'<tr><td class="mono">{m["id"]}</td>'
+                    f'<td class="muted">{m.get("name","")}</td>'
+                    f'<td>{eps or "<span class=muted>—</span>"}</td>'
+                    f'<td>{star}</td></tr>'
+                )
+            return "".join(rows)
+    
+        html = f"""<!DOCTYPE html>
+    <html lang="en" data-theme="dark">
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Copilot Proxy</title>
+    <style>
+    :root[data-theme="dark"] {{
+      --bg:#0f1117; --surface:#1a1d27; --border:#2a2d3a; --text:#e2e4ed;
+      --muted:#6b7280; --accent:#60a5fa; --green:#34d399; --red:#f87171;
+      --code-bg:#12151f; --hover:#21242f;
+      --tag-g-bg:#064e3b; --tag-g-fg:#6ee7b7;
+      --tag-b-bg:#1e3a5f; --tag-b-fg:#93c5fd;
+      --btn-bg:#1d4ed8; --btn-hover:#2563eb; --star:#fbbf24;
+    }}
+    :root[data-theme="light"] {{
+      --bg:#f8f9fb; --surface:#ffffff; --border:#e5e7eb; --text:#111827;
+      --muted:#6b7280; --accent:#2563eb; --green:#059669; --red:#dc2626;
+      --code-bg:#f1f3f7; --hover:#f3f4f6;
+      --tag-g-bg:#d1fae5; --tag-g-fg:#065f46;
+      --tag-b-bg:#dbeafe; --tag-b-fg:#1e40af;
+      --btn-bg:#2563eb; --btn-hover:#1d4ed8; --star:#d97706;
+    }}
+    *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;line-height:1.5;background:var(--bg);color:var(--text);transition:background .2s,color .2s}}
+    /* header */
+    .header{{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:10;gap:10px;flex-wrap:wrap}}
+    .header-left{{display:flex;align-items:center;gap:10px}}
+    .header-title{{font-size:15px;font-weight:600}}
+    .pulse{{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s ease-in-out infinite;flex-shrink:0}}
+    @keyframes pulse{{0%,100%{{opacity:1;transform:scale(1)}}50%{{opacity:.5;transform:scale(.85)}}}}
+    .header-meta{{font-size:12px;color:var(--muted)}}
+    .header-right{{display:flex;align-items:center;gap:8px}}
+    .pill{{font-size:12px;color:var(--muted);background:var(--bg);border:1px solid var(--border);border-radius:99px;padding:3px 10px}}
+    .theme-btn{{cursor:pointer;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);padding:5px 10px;font-size:13px;transition:background .15s}}
+    .theme-btn:hover{{background:var(--hover)}}
+    /* config strip */
+    .config-strip{{display:flex;align-items:center;gap:10px;padding:8px 20px;background:var(--surface);border-bottom:1px solid var(--border);flex-wrap:wrap}}
+    .config-label{{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);white-space:nowrap}}
+    .code-inline{{font-family:'SF Mono','Fira Code',monospace;font-size:12px;background:var(--code-bg);border:1px solid var(--border);border-radius:5px;padding:4px 10px;color:var(--accent);flex:1;min-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+    .copy-btn{{background:var(--btn-bg);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;transition:background .15s;white-space:nowrap;flex-shrink:0}}
+    .copy-btn:hover{{background:var(--btn-hover)}}
+    .config-sep{{width:1px;height:24px;background:var(--border);flex-shrink:0}}
+    /* stats */
+    .stats-inline{{display:flex;gap:16px;align-items:center;margin-left:auto}}
+    .stat-item{{text-align:center}}
+    .stat-num{{font-size:17px;font-weight:700;line-height:1}}
+    .stat-label{{font-size:10px;color:var(--muted)}}
+    .num-green{{color:var(--green)}} .num-red{{color:var(--red)}} .num-blue{{color:var(--accent)}}
+    /* page grid */
+    .page{{display:grid;grid-template-columns:minmax(260px,30%) 1fr;height:calc(100vh - 88px);overflow:hidden}}
+    @media(max-width:800px){{.page{{grid-template-columns:1fr;height:auto}}}}
+    /* panels */
+    .panel{{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border)}}
+    .panel:last-child{{border-right:none}}
+    .panel-header{{display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}}
+    .panel-title{{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}}
+    .panel-body{{flex:1;overflow-y:auto}}
+    /* tables */
+    table{{width:100%;border-collapse:collapse;font-size:12.5px}}
+    th{{text-align:left;padding:7px 12px;font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--surface);z-index:1}}
+    td{{padding:7px 12px;border-bottom:1px solid var(--border);vertical-align:middle}}
+    tr:last-child td{{border-bottom:none}}
+    tr:hover td{{background:var(--hover)}}
+    .mono{{font-family:'SF Mono','Fira Code',monospace;font-size:12px}}
+    .muted{{color:var(--muted)}}
+    .trunc{{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}}
+    .empty{{text-align:center;color:var(--muted);padding:24px}}
+    /* tags */
+    .tag{{display:inline-block;font-size:10px;border-radius:3px;padding:1px 5px;margin:1px;font-family:monospace;white-space:nowrap}}
+    .tag-green{{background:var(--tag-g-bg);color:var(--tag-g-fg)}}
+    .tag-blue{{background:var(--tag-b-bg);color:var(--tag-b-fg)}}
+    .tag-orange{{background:#431407;color:#fdba74}}
+    .tag-purple{{background:#2e1065;color:#c4b5fd}}
+    .status-ok{{color:var(--green);font-weight:600}}
+    .status-err{{color:var(--red);font-weight:600}}
+    .star{{color:var(--star)}}
+    .req-row{{cursor:default}}
+    </style>
+    </head>
+    <body>
+    <div class="header">
+      <div class="header-left">
+        <div class="pulse"></div>
+        <span class="header-title">Copilot Proxy</span>
+        <span class="header-meta">session {SESSION_ID[:8]} · {api_base}</span>
+      </div>
+      <div class="header-right">
+        <span class="pill">⏱ {uptime_str}</span>
+        <button class="theme-btn" onclick="toggleTheme()" id="themeBtn">☀ Light</button>
+      </div>
     </div>
-  </div>
-
-  <!-- Requests -->
-  <div class="panel">
-    <div class="panel-header">
-      <span class="panel-title">Requests (current session)</span>
-      <span id="req-count-label" style="font-size:11px;color:var(--muted)"></span>
+    
+    <div class="config-strip">
+      <span class="config-label">Claude Code</span>
+      <code class="code-inline" id="cfg1val">export ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=dummy</code>
+      <button class="copy-btn" onclick="copyText('cfg1val')">Copy</button>
+      <div class="config-sep"></div>
+      <code class="code-inline" id="cfg2val">ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=dummy claude</code>
+      <button class="copy-btn" onclick="copyText('cfg2val')">Copy</button>
+      <div class="stats-inline">
+        <div class="stat-item"><div class="stat-num num-blue" id="s-total">{req_count}</div><div class="stat-label">Total</div></div>
+        <div class="stat-item"><div class="stat-num num-green" id="s-ok">{ok_count}</div><div class="stat-label">OK</div></div>
+        <div class="stat-item"><div class="stat-num num-red" id="s-err">{err_count}</div><div class="stat-label">Err</div></div>
+        <div class="stat-item"><div class="stat-num">{len(models)}</div><div class="stat-label">Models</div></div>
+      </div>
     </div>
-    <div class="panel-body">
-      <table>
-        <thead>
-          <tr>
-            <th style="width:60px">Time</th>
-            <th style="width:100px">Model</th>
-            <th style="width:40px">St</th>
-            <th style="width:48px">ms</th>
-            <th style="width:90px">Type</th>
-            <th>Preview</th>
-          </tr>
-        </thead>
-        <tbody id="req-tbody"><tr><td colspan="6" class="empty">No requests yet</td></tr></tbody>
-      </table>
+    
+    <div class="page">
+      <!-- Models -->
+      <div class="panel">
+        <div class="panel-header"><span class="panel-title">Models ({len(models)})</span></div>
+        <div class="panel-body">
+          <table>
+            <thead><tr><th>Model ID</th><th>Name</th><th>Endpoint</th><th></th></tr></thead>
+            <tbody>
+              <tr><td colspan="4" style="padding:5px 12px;font-size:10px;font-weight:600;color:var(--muted);background:var(--bg)">CLAUDE — /v1/messages passthrough</td></tr>
+              {model_rows(claude_models)}
+              <tr><td colspan="4" style="padding:5px 12px;font-size:10px;font-weight:600;color:var(--muted);background:var(--bg)">Other Models</td></tr>
+              {model_rows(other_models)}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    
+      <!-- Requests -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Requests (current session)</span>
+          <span id="req-count-label" style="font-size:11px;color:var(--muted)"></span>
+        </div>
+        <div class="panel-body">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:60px">Time</th>
+                <th style="width:100px">Model</th>
+                <th style="width:40px">St</th>
+                <th style="width:48px">ms</th>
+                <th style="width:90px">Type</th>
+                <th>Preview</th>
+              </tr>
+            </thead>
+            <tbody id="req-tbody"><tr><td colspan="6" class="empty">No requests yet</td></tr></tbody>
+          </table>
+        </div>
+      </div>
     </div>
-  </div>
-</div>
-
-<script>
-// ── Theme ──
-const html = document.documentElement;
-const themeBtn = document.getElementById('themeBtn');
-applyTheme(localStorage.getItem('theme') || 'dark');
-function applyTheme(t) {{
-  html.dataset.theme = t;
-  themeBtn.textContent = t === 'dark' ? '☀ Light' : '☾ Dark';
-  localStorage.setItem('theme', t);
-}}
-function toggleTheme() {{ applyTheme(html.dataset.theme === 'dark' ? 'light' : 'dark'); }}
-
-// ── Copy ──
-function copyText(id) {{
-  navigator.clipboard.writeText(document.getElementById(id).textContent).then(() => {{
-    const b = document.getElementById(id).nextElementSibling;
-    b.textContent = 'Copied ✓'; setTimeout(() => b.textContent = 'Copy', 1500);
-  }});
-}}
-
-// ── Escape HTML ──
-function esc(s) {{
-  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}}
-
-// ── Requests ──
-let _all = [];
-
-function msgTypeSummary(msgs) {{
-  if (!msgs || !msgs.length) return '';
-  const counts = {{}};
-  msgs.forEach(m => {{ counts[m.kind] = (counts[m.kind]||0) + 1; }});
-  const cls = {{ message:'tag-blue', tool_use:'tag-orange', tool_result:'tag-purple' }};
-  return Object.entries(counts).map(([k,v]) =>
-    `<span class="tag ${{cls[k]||'tag-blue'}}">${{k==='message'?'msg':k==='tool_use'?'tool↑':'tool↓'}} ${{v}}</span>`
-  ).join('');
-}}
-
-function lastPreview(r) {{
-  const msgs = r.messages;
-  if (msgs && msgs.length) {{
-    const last = msgs[msgs.length-1];
-    const text = (last.kind === 'message') ? (last.preview || '') : (last.body || last.preview || '');
-    return esc(text.slice(0, 120));
-  }}
-  return esc((r.request_preview?.last_user_msg || '').slice(0, 120));
-}}
-
-async function loadRequests() {{
-  try {{
-    const data = await fetch('/audit/current').then(r => r.json());
-    const reqs = (data.requests || []).slice().reverse();
-    if (reqs.length === _all.length) return;  // no change
-    _all = reqs;
-    renderRows();
-    document.getElementById('req-count-label').textContent = _all.length + ' requests';
-    // update stats
-    const ok = _all.filter(r => r.response?.status_code === 200).length;
-    document.getElementById('s-total').textContent = _all.length;
-    document.getElementById('s-ok').textContent = ok;
-    document.getElementById('s-err').textContent = _all.length - ok;
-  }} catch(e) {{}}
-}}
-
-function renderRows() {{
-  const tbody = document.getElementById('req-tbody');
-  if (!_all.length) {{
-    tbody.innerHTML = '<tr><td colspan="6" class="empty">No requests yet</td></tr>';
-    return;
-  }}
-  tbody.innerHTML = _all.map(r => {{
-    const ok  = r.response?.status_code === 200;
-    const cls = ok ? 'status-ok' : 'status-err';
-    const ts  = (r.timestamp||'').slice(11,19);
-    const typeTags = msgTypeSummary(r.messages);
-    const preview  = lastPreview(r);
-    return `<tr>
-      <td class="muted mono" style="white-space:nowrap">${{ts}}</td>
-      <td class="mono trunc" style="max-width:100px">${{esc(r.copilot_model||r.original_model||'')}}</td>
-      <td><span class="${{cls}}">${{r.response?.status_code??'—'}}</span></td>
-      <td class="muted" style="white-space:nowrap">${{r.duration_ms!=null?Math.round(r.duration_ms):'—'}}</td>
-      <td>${{typeTags||'<span class="muted">—</span>'}}</td>
-      <td class="trunc" style="max-width:0;color:var(--muted);font-size:11px">${{preview}}</td>
-    </tr>`;
-  }}).join('');
-}}
-
-// ── Modal ──
-loadRequests();
-setInterval(loadRequests, 5000);
-</script>
-</body>
-</html>"""
-    return HTMLResponse(content=html)
+    
+    <script>
+    // ── Theme ──
+    const html = document.documentElement;
+    const themeBtn = document.getElementById('themeBtn');
+    applyTheme(localStorage.getItem('theme') || 'dark');
+    function applyTheme(t) {{
+      html.dataset.theme = t;
+      themeBtn.textContent = t === 'dark' ? '☀ Light' : '☾ Dark';
+      localStorage.setItem('theme', t);
+    }}
+    function toggleTheme() {{ applyTheme(html.dataset.theme === 'dark' ? 'light' : 'dark'); }}
+    
+    // ── Copy ──
+    function copyText(id) {{
+      navigator.clipboard.writeText(document.getElementById(id).textContent).then(() => {{
+        const b = document.getElementById(id).nextElementSibling;
+        b.textContent = 'Copied ✓'; setTimeout(() => b.textContent = 'Copy', 1500);
+      }});
+    }}
+    
+    // ── Escape HTML ──
+    function esc(s) {{
+      return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }}
+    
+    // ── Requests ──
+    let _all = [];
+    
+    function msgTypeSummary(msgs) {{
+      if (!msgs || !msgs.length) return '';
+      const counts = {{}};
+      msgs.forEach(m => {{ counts[m.kind] = (counts[m.kind]||0) + 1; }});
+      const cls = {{ message:'tag-blue', tool_use:'tag-orange', tool_result:'tag-purple' }};
+      return Object.entries(counts).map(([k,v]) =>
+        `<span class="tag ${{cls[k]||'tag-blue'}}">${{k==='message'?'msg':k==='tool_use'?'tool↑':'tool↓'}} ${{v}}</span>`
+      ).join('');
+    }}
+    
+    function lastPreview(r) {{
+      const msgs = r.messages;
+      if (msgs && msgs.length) {{
+        const last = msgs[msgs.length-1];
+        const text = (last.kind === 'message') ? (last.preview || '') : (last.body || last.preview || '');
+        return esc(text.slice(0, 120));
+      }}
+      return esc((r.request_preview?.last_user_msg || '').slice(0, 120));
+    }}
+    
+    async function loadRequests() {{
+      try {{
+        const data = await fetch('/audit/current').then(r => r.json());
+        const reqs = (data.requests || []).slice().reverse();
+        if (reqs.length === _all.length) return;  // no change
+        _all = reqs;
+        renderRows();
+        document.getElementById('req-count-label').textContent = _all.length + ' requests';
+        // update stats
+        const ok = _all.filter(r => r.response?.status_code === 200).length;
+        document.getElementById('s-total').textContent = _all.length;
+        document.getElementById('s-ok').textContent = ok;
+        document.getElementById('s-err').textContent = _all.length - ok;
+      }} catch(e) {{}}
+    }}
+    
+    function renderRows() {{
+      const tbody = document.getElementById('req-tbody');
+      if (!_all.length) {{
+        tbody.innerHTML = '<tr><td colspan="6" class="empty">No requests yet</td></tr>';
+        return;
+      }}
+      tbody.innerHTML = _all.map(r => {{
+        const ok  = r.response?.status_code === 200;
+        const cls = ok ? 'status-ok' : 'status-err';
+        const ts  = (r.timestamp||'').slice(11,19);
+        const typeTags = msgTypeSummary(r.messages);
+        const preview  = lastPreview(r);
+        return `<tr>
+          <td class="muted mono" style="white-space:nowrap">${{ts}}</td>
+          <td class="mono trunc" style="max-width:100px">${{esc(r.copilot_model||r.original_model||'')}}</td>
+          <td><span class="${{cls}}">${{r.response?.status_code??'—'}}</span></td>
+          <td class="muted" style="white-space:nowrap">${{r.duration_ms!=null?Math.round(r.duration_ms):'—'}}</td>
+          <td>${{typeTags||'<span class="muted">—</span>'}}</td>
+          <td class="trunc" style="max-width:0;color:var(--muted);font-size:11px">${{preview}}</td>
+        </tr>`;
+      }}).join('');
+    }}
+    
+    // ── Modal ──
+    loadRequests();
+    setInterval(loadRequests, 5000);
+    </script>
+    </body>
+    </html>"""
+        return HTMLResponse(content=html)
 
 
 # ============================================================
@@ -950,26 +995,35 @@ setInterval(loadRequests, 5000);
 if __name__ == "__main__":
     import uvicorn
 
+    host = "0.0.0.0" if ARGS.share else "127.0.0.1"
+
     logger.info("=== GitHub Copilot → Anthropic Proxy Starting ===")
     logger.info("Session ID: %s", SESSION_ID)
-    logger.info("Audit file: %s", AUDIT_FILE)
+    logger.info("Mode: %s", ("fast" if ARGS.fast else "normal") + (" + share" if ARGS.share else ""))
+    if not ARGS.fast:
+        logger.info("Audit file: %s", AUDIT_FILE)
 
     logger.info("Initializing GitHub Copilot authentication...")
     try:
         api_key = get_api_key()
         api_base = get_api_base()
         logger.info("Authentication successful, API base: %s", api_base)
-        # Preload model list
         models = get_models()
         logger.info("Loaded %d models", len(models))
     except Exception as e:
         logger.warning("Authentication failed at startup (will retry on first request): %s", e)
 
+    base_url = f"http://{host}:{ARGS.port}"
     print("\n" + "=" * 55)
-    print("  Dashboard: http://localhost:8082/ui")
+    if not ARGS.fast:
+        print(f"  Dashboard: {base_url}/ui")
     print("  Configure Claude Code:")
-    print("    export ANTHROPIC_BASE_URL=http://localhost:8082")
-    print("    export ANTHROPIC_AUTH_TOKEN=dummy")
+    print(f"    export ANTHROPIC_BASE_URL={base_url}")
+    print( "    export ANTHROPIC_AUTH_TOKEN=dummy")
+    if ARGS.share:
+        print("  ⚠  Share mode: accessible to anyone on the LAN")
+    if ARGS.fast:
+        print("  Fast mode: UI and audit disabled")
     print("=" * 55 + "\n")
 
-    uvicorn.run(app, host="0.0.0.0", port=8082, log_level="warning")
+    uvicorn.run(app, host=host, port=ARGS.port, log_level="warning")
