@@ -781,7 +781,10 @@ if not ARGS.fast:
     .theme-btn:hover{{background:var(--hover)}}
     /* config strip */
     .config-strip{{display:flex;align-items:center;gap:10px;padding:8px 20px;background:var(--surface);border-bottom:1px solid var(--border);flex-wrap:wrap}}
-    .config-label{{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);white-space:nowrap}}
+    .os-tabs{{display:flex;gap:2px;flex-shrink:0}}
+    .os-tab{{cursor:pointer;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--muted);padding:3px 9px;font-size:11px;transition:background .15s,color .15s}}
+    .os-tab:hover{{background:var(--hover)}}
+    .os-tab.active{{background:var(--btn-bg);color:#fff;border-color:var(--btn-bg)}}
     .code-inline{{font-family:'SF Mono','Fira Code',monospace;font-size:12px;background:var(--code-bg);border:1px solid var(--border);border-radius:5px;padding:4px 10px;color:var(--accent);flex:1;min-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
     .copy-btn{{background:var(--btn-bg);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;transition:background .15s;white-space:nowrap;flex-shrink:0}}
     .copy-btn:hover{{background:var(--btn-hover)}}
@@ -837,12 +840,13 @@ if not ARGS.fast:
     </div>
     
     <div class="config-strip">
-      <span class="config-label">Claude Code</span>
-      <code class="code-inline" id="cfg1val">export ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=dummy</code>
-      <button class="copy-btn" onclick="copyText('cfg1val')">Copy</button>
-      <div class="config-sep"></div>
-      <code class="code-inline" id="cfg2val">ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=dummy claude</code>
-      <button class="copy-btn" onclick="copyText('cfg2val')">Copy</button>
+      <div class="os-tabs">
+        <button class="os-tab active" onclick="switchOS('mac')">macOS/Linux</button>
+        <button class="os-tab" onclick="switchOS('ps')">PowerShell</button>
+      </div>
+      <code class="code-inline" id="cfg-mac">export ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=dummy &amp;&amp; claude</code>
+      <code class="code-inline" id="cfg-ps" style="display:none">$env:ANTHROPIC_BASE_URL="http://localhost:8082"; $env:ANTHROPIC_AUTH_TOKEN="dummy"; claude</code>
+      <button class="copy-btn" onclick="copyActive()">Copy</button>
       <div class="stats-inline">
         <div class="stat-item"><div class="stat-num num-blue" id="s-total">{req_count}</div><div class="stat-label">Total</div></div>
         <div class="stat-item"><div class="stat-num num-green" id="s-ok">{ok_count}</div><div class="stat-label">OK</div></div>
@@ -903,11 +907,22 @@ if not ARGS.fast:
       localStorage.setItem('theme', t);
     }}
     function toggleTheme() {{ applyTheme(html.dataset.theme === 'dark' ? 'light' : 'dark'); }}
-    
-    // ── Copy ──
-    function copyText(id) {{
-      navigator.clipboard.writeText(document.getElementById(id).textContent).then(() => {{
-        const b = document.getElementById(id).nextElementSibling;
+
+    // ── OS tab + copy ──
+    let _activeOS = 'mac';
+    function switchOS(os) {{
+      _activeOS = os;
+      ['mac','ps'].forEach(k => {{
+        document.getElementById('cfg-'+k).style.display = k===os ? '' : 'none';
+      }});
+      document.querySelectorAll('.os-tab').forEach((b,i) => {{
+        b.classList.toggle('active', ['mac','ps'][i] === os);
+      }});
+    }}
+    function copyActive() {{
+      const text = document.getElementById('cfg-'+_activeOS).textContent;
+      navigator.clipboard.writeText(text).then(() => {{
+        const b = document.querySelector('.copy-btn');
         b.textContent = 'Copied ✓'; setTimeout(() => b.textContent = 'Copy', 1500);
       }});
     }}
@@ -1014,16 +1029,20 @@ if __name__ == "__main__":
         logger.warning("Authentication failed at startup (will retry on first request): %s", e)
 
     base_url = f"http://{host}:{ARGS.port}"
-    print("\n" + "=" * 55)
+    print("\n" + "=" * 60)
     if not ARGS.fast:
-        print(f"  Dashboard: {base_url}/ui")
+        print(f"  Dashboard : {base_url}/ui")
     print("  Configure Claude Code:")
+    print("  [macOS/Linux]")
     print(f"    export ANTHROPIC_BASE_URL={base_url}")
     print( "    export ANTHROPIC_AUTH_TOKEN=dummy")
+    print("  [Windows PowerShell]")
+    print(f'    $env:ANTHROPIC_BASE_URL="{base_url}"')
+    print( '    $env:ANTHROPIC_AUTH_TOKEN="dummy"')
     if ARGS.share:
         print("  ⚠  Share mode: accessible to anyone on the LAN")
     if ARGS.fast:
         print("  Fast mode: UI and audit disabled")
-    print("=" * 55 + "\n")
+    print("=" * 60 + "\n")
 
     uvicorn.run(app, host=host, port=ARGS.port, log_level="warning")
